@@ -41,7 +41,7 @@ button, input, textarea, select { font: inherit; }
 .hero-stats span { color: #c6c6c6; font-size: 10px; }
 .hero-stats .critical { color: #ff8389; }
 .hero-stats .caution { color: #f1c21b; }
-.workspace-tabs { padding: 0 clamp(20px, 4vw, 60px); display: grid; grid-template-columns: repeat(4, 1fr); background: #fff; border-bottom: 1px solid #d8d8d8; }
+.workspace-tabs { padding: 0 clamp(20px, 4vw, 60px); display: grid; grid-template-columns: repeat(5, 1fr); background: #fff; border-bottom: 1px solid #d8d8d8; }
 .workspace-tabs button { min-height: 78px; border: 0; border-right: 1px solid #e0e0e0; padding: 14px 16px; display: grid; grid-template-columns: 34px 1fr; grid-template-rows: auto auto; text-align: left; color: #525252; background: #fff; cursor: pointer; }
 .workspace-tabs button:first-child { border-left: 1px solid #e0e0e0; }
 .workspace-tabs button.active { color: #fff; background: #0f62fe; }
@@ -98,7 +98,7 @@ button, input, textarea, select { font: inherit; }
 .peek-row b { color: #393939; font-size: 11px; }
 .peek-row small { color: #8d8d8d; font-size: 9px; }
 .empty-state { color: #6f6f6f; font-size: 12px; line-height: 1.6; }
-.path-view, .issues-view, .versions-view { padding: 30px clamp(20px, 4vw, 60px) 44px; }
+.path-view, .issues-view, .versions-view, .merge-view { padding: 30px clamp(20px, 4vw, 60px) 44px; }
 .path-toolbar, .view-heading { display: flex; justify-content: space-between; align-items: end; gap: 28px; margin-bottom: 24px; }
 .path-toolbar h2, .view-heading h2 { margin: 0; font-size: 28px; letter-spacing: -.02em; }
 .path-toolbar p, .view-heading p { margin: 7px 0 0; color: #6f6f6f; font-size: 13px; }
@@ -179,6 +179,38 @@ button, input, textarea, select { font: inherit; }
 .diff-list b { font-size: 12px; }
 .diff-list p { margin: 3px 0 0; color: #6f6f6f; font-size: 10px; }
 .app-footer { min-height: 46px; padding: 14px 24px; display: flex; justify-content: space-between; gap: 20px; color: #c6c6c6; background: #262626; font-size: 10px; }
+.pending-badge { padding: 3px 10px; border: 1px solid #f1c21b; border-radius: 999px; color: #f1c21b; background: transparent; cursor: pointer; font-size: 10px; }
+.pending-badge:hover { background: rgba(241, 194, 27, .15); }
+.merge-error { margin-bottom: 14px; }
+.merge-layout { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; align-items: start; }
+.merge-card { margin: 0 0 12px; padding: 22px; border: 1px solid #e0e0e0; }
+.file-input { margin: 14px 0; font-size: 12px; }
+.merge-card :global(.bx--text-area) { margin-bottom: 14px; }
+.merge-rules { margin: 16px 0 0; padding: 0; list-style: none; display: grid; gap: 12px; }
+.merge-rules li { display: grid; grid-template-columns: 96px 1fr; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #e0e0e0; }
+.merge-rules li:last-child { border-bottom: 0; padding-bottom: 0; }
+.merge-rules b { color: #0f62fe; font-size: 12px; }
+.merge-rules span { color: #525252; font-size: 12px; line-height: 1.6; }
+.merge-preview { display: grid; gap: 12px; }
+.merge-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.merge-summary > div { margin: 0; padding: 18px; border-top: 3px solid #0f62fe; }
+.merge-summary > div.merge-blocking { border-top-color: #da1e28; }
+.merge-summary span { color: #6f6f6f; font-size: 10px; }
+.merge-summary strong { display: block; margin: 5px 0; font: 600 22px/1.1 "IBM Plex Mono", monospace; }
+.merge-summary p { margin: 0; color: #6f6f6f; font-size: 11px; }
+.conflict-list { margin-top: 16px; display: grid; gap: 7px; }
+.conflict-list article { display: grid; grid-template-columns: 64px 1fr; gap: 12px; padding: 12px; border-left: 4px solid #8a3ffc; background: #f6f2ff; }
+.conflict-list article.blocking { border-left-color: #da1e28; background: #fff1f1; }
+.conflict-list article > span { color: #6929c4; font-size: 10px; font-weight: 700; }
+.conflict-list article.blocking > span { color: #a2191f; }
+.conflict-list b { font-size: 12px; }
+.conflict-list p { margin: 3px 0 0; color: #6f6f6f; font-size: 10px; }
+.appended-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid #e0e0e0; }
+.appended-row:last-of-type { border-bottom: 0; }
+.appended-row b { font-size: 12px; }
+.appended-row small { margin-left: auto; color: #8d8d8d; font-size: 10px; }
+.confirm-card { border-top: 3px solid #0f62fe; }
+.confirm-actions { margin: 14px 0 10px; display: flex; gap: 8px; justify-content: flex-end; }
 @media (max-width: 1180px) {
   .compose-layout { grid-template-columns: 280px 1fr; }
   .inspector { grid-column: 1 / 3; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -198,7 +230,8 @@ button, input, textarea, select { font: inherit; }
   .inspector, .path-toolbar, .view-heading { display: flex; align-items: stretch; flex-direction: column; }
   .preview-stage { padding: 8px; }
   .device-preview.tablet, .device-preview.desktop { width: 100%; }
-  .rule-grid, .version-layout-svelte { grid-template-columns: 1fr; }
+  .rule-grid, .version-layout-svelte, .merge-layout { grid-template-columns: 1fr; }
+  .merge-summary { grid-template-columns: repeat(2, 1fr); }
   .issue-board > article { grid-template-columns: 38px 1fr; }
   .issue-board > article > button { grid-column: 2; width: fit-content; }
 }

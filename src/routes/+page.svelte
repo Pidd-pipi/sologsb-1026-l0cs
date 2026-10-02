@@ -13,7 +13,7 @@
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
-  type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
+  type ViewMode = 'compose' | 'path' | 'issues' | 'versions' | 'merge';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
 
@@ -41,6 +41,7 @@
 
   interface Course {
     id: string;
+    revision: number;
     title: string;
     level: string;
     ageRange: string;
@@ -66,13 +67,31 @@
     detail: string;
   }
 
+  interface MergeConflict {
+    id: string;
+    kind: 'both-kept' | 'missing-dependency' | 'cycle';
+    activityId: string;
+    title: string;
+    detail: string;
+  }
+
+  interface MergePreview {
+    incomingTitle: string;
+    added: Activity[];
+    keptBoth: MergeConflict[];
+    blocking: MergeConflict[];
+    merged: Activity[];
+  }
+
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const COURSE_REVISION = 2;
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
 
   const initialCourse = (): Course => ({
     id: 'course-phonics-1',
+    revision: COURSE_REVISION,
     title: 'Starter Phonics · 声音侦探',
     level: '启蒙一级',
     ageRange: '5–6 岁',
@@ -172,6 +191,10 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let mergePreview: MergePreview | null = null;
+  let mergeError = '';
+  let importText = '';
+  let mergeAcknowledged = false;
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
@@ -179,6 +202,7 @@
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: pendingMergeCount = mergePreview ? mergePreview.keptBoth.length + mergePreview.blocking.length : 0;
 
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -195,8 +219,16 @@
     }
     hydrated = true;
     const updateNetwork = () => {
+      const wasOffline = !online;
       online = navigator.onLine;
       showOfflineNotice = !online;
+      if (online && wasOffline) {
+        // 重新连网：按最新依赖重算检查结果，并提示待确认合并数量
+        course = { ...course };
+        savedLabel = pendingMergeCount
+          ? `已重连 · ${pendingMergeCount} 项合并冲突待确认`
+          : '已重连 · 检查结果已按最新依赖重算';
+      }
     };
     updateNetwork();
     window.addEventListener('online', updateNetwork);
@@ -208,7 +240,21 @@
   });
 
   function migrateCourse(value: Course): Course {
-    if (!value.id || !Array.isArray(value.activities)) return initialCourse();
+    if (!value || !value.id || !Array.isArray(value.activities)) return initialCourse();
+    // 旧课程包缺修订号：先补齐字段完成升级，之后照常参与合并
+    if (typeof value.revision !== 'number') {
+      value.activities.forEach((activity) => {
+        activity.content ??= '';
+        activity.phonemes ??= [];
+        activity.dependencies ??= [];
+        activity.difficulty ??= 1;
+        activity.prompt ??= '';
+        activity.accessibility ??= '';
+        activity.duration ??= 8;
+        activity.feedback ??= '';
+      });
+      value.revision = COURSE_REVISION;
+    }
     value.versions ??= [];
     return value;
   }
@@ -507,6 +553,139 @@
     return rows;
   }
 
+  function buildMergePreview(local: Course, incoming: Course): MergePreview {
+    const merged = structuredClone(local.activities);
+    const added: Activity[] = [];
+    const keptBoth: MergeConflict[] = [];
+    const differingKeyFields = (a: Activity, b: Activity): string[] => {
+      const fields: string[] = [];
+      if (a.title !== b.title) fields.push('标题');
+      if (JSON.stringify(a.phonemes) !== JSON.stringify(b.phonemes)) fields.push('音素');
+      if (JSON.stringify(a.dependencies) !== JSON.stringify(b.dependencies)) fields.push('依赖');
+      return fields;
+    };
+
+    incoming.activities.forEach((incomingActivity) => {
+      const localActivity = merged.find((activity) => activity.id === incomingActivity.id);
+      if (!localActivity) {
+        // 新增活动直接接到课程末尾
+        const copy = structuredClone(incomingActivity);
+        added.push(copy);
+        merged.push(copy);
+        return;
+      }
+      const changed = differingKeyFields(localActivity, incomingActivity);
+      if (changed.length) {
+        // 标题、音素或依赖不一致：本地与外来两版都先留下
+        const copy = structuredClone(incomingActivity);
+        let candidateId = `${incomingActivity.id}-ext`;
+        let suffix = 2;
+        while (merged.some((activity) => activity.id === candidateId)) {
+          candidateId = `${incomingActivity.id}-ext${suffix}`;
+          suffix += 1;
+        }
+        copy.id = candidateId;
+        copy.title = `${incomingActivity.title}（外来）`;
+        merged.push(copy);
+        keptBoth.push({
+          id: `both-${incomingActivity.id}`, kind: 'both-kept', activityId: incomingActivity.id,
+          title: `“${localActivity.title}”本地与外来版本不一致`,
+          detail: `变化字段：${changed.join('、')}。两版均已保留，外来版编号为 ${candidateId}，确认后可在编排页删减。`
+        });
+      }
+    });
+
+    const blocking: MergeConflict[] = [];
+    const mergedIds = new Set(merged.map((activity) => activity.id));
+    merged.forEach((activity) => {
+      activity.dependencies.forEach((dependency) => {
+        if (!mergedIds.has(dependency)) blocking.push({
+          id: `missing-${activity.id}-${dependency}`, kind: 'missing-dependency', activityId: activity.id,
+          title: `“${activity.title}”的依赖 ${dependency} 指向缺失活动`,
+          detail: '合并后的活动清单中找不到该前置活动，请确认后在编排页修正或移除该依赖。'
+        });
+      });
+    });
+    const cycle = findDependencyCycle(merged);
+    if (cycle) blocking.push({
+      id: 'merge-cycle', kind: 'cycle', activityId: cycle[0],
+      title: '合并后的依赖关系形成循环', detail: cycle.join(' → ')
+    });
+
+    return { incomingTitle: incoming.title, added, keptBoth, blocking, merged };
+  }
+
+  function previewMerge(): void {
+    mergeError = '';
+    try {
+      const parsed = JSON.parse(importText) as Course;
+      const upgraded = migrateCourse(parsed);
+      mergePreview = buildMergePreview(course, upgraded);
+      mergeAcknowledged = false;
+    } catch {
+      // 导入中断：本地草稿保持不变，修正内容后可重试
+      mergePreview = null;
+      mergeError = '课程包解析失败，本地草稿未受影响。请检查文件内容后重试。';
+    }
+  }
+
+  function confirmMerge(): void {
+    if (!mergePreview || !mergeAcknowledged) return;
+    const preview = mergePreview;
+    const mergedActivities = structuredClone(preview.merged);
+    commit((draft) => {
+      draft.activities = mergedActivities;
+      // 活动清单与版本快照一起更新
+      draft.versions.push({
+        id: `v-${Date.now()}`,
+        label: `合并「${preview.incomingTitle}」`,
+        savedAt: new Date().toISOString(),
+        note: `新增 ${preview.added.length} 个活动，双版本保留 ${preview.keptBoth.length} 组，依赖冲突 ${preview.blocking.length} 项。`,
+        activities: structuredClone(mergedActivities)
+      });
+    });
+    compareTargetId = course.versions.at(-1)?.id ?? '';
+    mergePreview = null;
+    importText = '';
+    mergeAcknowledged = false;
+    savedLabel = '合并完成，已写入新版本';
+  }
+
+  function cancelMerge(): void {
+    mergePreview = null;
+    mergeAcknowledged = false;
+    savedLabel = '已放弃合并，本地草稿保持不变';
+  }
+
+  function exportCourse(): void {
+    const blob = new Blob([JSON.stringify(course, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${course.title.replace(/\s+/g, '-')}.course.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    savedLabel = '课程包已导出，可发给同事合并';
+  }
+
+  function readImportFile(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      importText = String(reader.result ?? '');
+      previewMerge();
+    };
+    reader.onerror = () => {
+      // 读取中断：保住本地草稿，允许重新选择文件
+      mergePreview = null;
+      mergeError = '读取文件时中断，本地草稿未受影响，请重新选择文件重试。';
+    };
+    reader.readAsText(file);
+    input.value = '';
+  }
+
   function formatTime(value: string): string {
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
@@ -562,6 +741,9 @@
     <div class="header-center">
       <span class:connected={online} class="network-dot"></span>
       <span>{online ? '本地离线编辑可用' : '当前离线，修改仍会保存'}</span>
+      {#if pendingMergeCount}
+        <button class="pending-badge" on:click={() => activeView = 'merge'}>待确认 {pendingMergeCount}</button>
+      {/if}
       <strong>{savedLabel}</strong>
     </div>
     <div class="header-actions">
@@ -597,6 +779,7 @@
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'merge'} on:click={() => activeView = 'merge'}><span>05</span><b>合并协作{#if pendingMergeCount}（{pendingMergeCount}）{/if}</b><small>导入课程包与冲突确认</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -803,6 +986,89 @@
           </div>
         </Tile>
       </div>
+    </main>
+  {/if}
+
+  {#if activeView === 'merge'}
+    <main class="merge-view">
+      <div class="view-heading">
+        <div><span class="kicker">OFFLINE MERGE</span><h2>课程包合并</h2><p>断网期间两位老师各自编辑的课程包，按稳定编号对齐合并；教师确认前不会写入新版本。</p></div>
+        <div class="version-actions"><Button kind="tertiary" on:click={exportCourse}>导出本机课程包</Button></div>
+      </div>
+
+      {#if mergeError}
+        <div class="merge-error">
+          <InlineNotification lowContrast kind="error" title="导入中断" subtitle={mergeError} on:close={() => mergeError = ''} />
+        </div>
+      {/if}
+
+      {#if !mergePreview}
+        <div class="merge-layout">
+          <Tile class="merge-card">
+            <div class="section-title">
+              <div><span class="kicker">IMPORT</span><h3>导入外来课程包</h3><p>选择同事导出的 JSON 课程包，或直接粘贴内容。缺少修订号的旧版课程包会先自动升级，再照常合并。</p></div>
+            </div>
+            <input class="file-input" type="file" accept="application/json,.json" on:change={readImportFile} aria-label="选择课程包文件" />
+            <TextArea labelText="或粘贴课程包 JSON" rows={9} value={importText} placeholder="粘贴同事导出的课程包 JSON 内容" on:input={(event) => importText = readText(event)} />
+            <Button kind="primary" disabled={!importText.trim()} on:click={previewMerge}>解析并预演合并</Button>
+          </Tile>
+          <Tile class="merge-card">
+            <div class="section-title"><div><span class="kicker">RULES</span><h3>合并规则</h3></div></div>
+            <ul class="merge-rules">
+              <li><b>稳定编号对齐</b><span>同一编号的活动视为同一活动，外来包与本地逐一对应。</span></li>
+              <li><b>新增直接接上</b><span>外来包中新增的活动按顺序追加到课程末尾。</span></li>
+              <li><b>两版都先留下</b><span>同一活动的标题、音素或依赖不一致时，本地与外来版本同时保留。</span></li>
+              <li><b>冲突先列出</b><span>依赖指向缺失活动或形成循环时列为冲突，教师确认后才写入新版本。</span></li>
+              <li><b>中断可重试</b><span>解析或读取失败不影响本地草稿，修正后可再次导入。</span></li>
+            </ul>
+          </Tile>
+        </div>
+      {:else}
+        <div class="merge-preview">
+          <div class="merge-summary">
+            <Tile><span>新增活动</span><strong>{mergePreview.added.length}</strong><p>直接接到课程末尾</p></Tile>
+            <Tile><span>双版本保留</span><strong>{mergePreview.keptBoth.length}</strong><p>本地与外来两版都留下</p></Tile>
+            <Tile class="merge-blocking"><span>依赖冲突</span><strong>{mergePreview.blocking.length}</strong><p>缺失依赖或循环</p></Tile>
+            <Tile><span>合并后活动</span><strong>{mergePreview.merged.length}</strong><p>确认后写入新版本</p></Tile>
+          </div>
+
+          {#if mergePreview.keptBoth.length || mergePreview.blocking.length}
+            <Tile class="merge-card">
+              <div class="section-title"><div><span class="kicker">CONFLICTS</span><h3>待确认冲突</h3></div><Tag type="magenta">{pendingMergeCount} 项</Tag></div>
+              <div class="conflict-list">
+                {#each [...mergePreview.blocking, ...mergePreview.keptBoth] as conflict (conflict.id)}
+                  <article class:blocking={conflict.kind !== 'both-kept'}>
+                    <span>{conflict.kind === 'both-kept' ? '双版本' : conflict.kind === 'missing-dependency' ? '依赖缺失' : '循环依赖'}</span>
+                    <div><b>{conflict.title}</b><p>{conflict.detail}</p></div>
+                  </article>
+                {/each}
+              </div>
+            </Tile>
+          {/if}
+
+          {#if mergePreview.added.length}
+            <Tile class="merge-card">
+              <div class="section-title"><div><span class="kicker">APPENDED</span><h3>新增活动（接上课程末尾）</h3></div></div>
+              {#each mergePreview.added as activity (activity.id)}
+                <div class="appended-row"><Tag type="teal">{activity.type}</Tag><b>{activity.title}</b><small>{activity.duration} 分钟 · 难度 {activity.difficulty}/5</small></div>
+              {/each}
+            </Tile>
+          {/if}
+
+          <Tile class="merge-card confirm-card">
+            <Checkbox
+              labelText={mergePreview.blocking.length ? `我已核对以上冲突（含 ${mergePreview.blocking.length} 项依赖问题），确认把合并结果写入新版本` : '我已核对以上冲突与新增活动，确认把合并结果写入新版本'}
+              checked={mergeAcknowledged}
+              on:change={(event) => mergeAcknowledged = readChecked(event)}
+            />
+            <div class="confirm-actions">
+              <Button kind="danger-ghost" on:click={cancelMerge}>放弃合并</Button>
+              <Button kind="primary" disabled={!mergeAcknowledged} on:click={confirmMerge}>确认合并并写入新版本</Button>
+            </div>
+            <p class="empty-state">确认前不会改动活动清单，也不会生成版本快照；放弃合并不影响本地草稿。</p>
+          </Tile>
+        </div>
+      {/if}
     </main>
   {/if}
 
