@@ -45,9 +45,34 @@
     level: string;
     ageRange: string;
     objective: string;
+    revision: number;
     activities: Activity[];
     versions: CourseVersion[];
     updatedAt: string;
+  }
+
+  type MergeConflictKind = 'content' | 'missing-dep' | 'cycle';
+  type ConflictResolution = 'pending' | 'keep-local' | 'keep-foreign' | 'keep-both';
+
+  interface MergeConflict {
+    id: string;
+    kind: MergeConflictKind;
+    activityId: string;
+    dependencyId?: string;
+    foreignActivityId?: string;
+    title: string;
+    detail: string;
+    resolution: ConflictResolution;
+  }
+
+  interface PendingMerge {
+    id: string;
+    sourceName: string;
+    importedAt: string;
+    addedCount: number;
+    baseCourse: Course;
+    foreign: Course;
+    conflicts: MergeConflict[];
   }
 
   interface Diagnostic {
@@ -67,6 +92,7 @@
   }
 
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
+  const MERGE_STORAGE_KEY = 'sologsb-1026-phonics-merge-v1';
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
@@ -77,6 +103,7 @@
     level: '启蒙一级',
     ageRange: '5–6 岁',
     objective: '建立音素意识，能听辨、拼读并书写短元音单词。',
+    revision: 1,
     updatedAt: '2026-09-24T16:20:00+08:00',
     activities: [
       {
@@ -172,6 +199,10 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let pendingMerge: PendingMerge | null = null;
+  let importError = '';
+  let onlineNotice = false;
+  let importInput: HTMLInputElement | null = null;
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
@@ -179,6 +210,12 @@
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+  $: pendingConflicts = pendingMerge?.conflicts ?? [];
+  $: pendingCount = pendingConflicts.filter((conflict) => conflict.resolution === 'pending').length;
+  $: contentConflictCount = pendingConflicts.filter((conflict) => conflict.kind === 'content').length;
+  $: missingDepCount = pendingConflicts.filter((conflict) => conflict.kind === 'missing-dep' && conflict.resolution === 'pending').length;
+  $: cycleConflictCount = pendingConflicts.filter((conflict) => conflict.kind === 'cycle' && conflict.resolution === 'pending').length;
+  $: blockingConflicts = pendingConflicts.filter((conflict) => conflict.resolution === 'pending' && (conflict.kind === 'missing-dep' || conflict.kind === 'cycle'));
 
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -193,10 +230,31 @@
         localStorage.removeItem(STORAGE_KEY);
       }
     }
+    const storedMerge = localStorage.getItem(MERGE_STORAGE_KEY);
+    if (storedMerge) {
+      try {
+        const restored = JSON.parse(storedMerge) as PendingMerge;
+        if (restored && Array.isArray(restored.conflicts) && restored.baseCourse && restored.foreign) {
+          pendingMerge = restored;
+          activeView = 'versions';
+          savedLabel = '合并草稿已恢复，等待确认';
+        } else {
+          localStorage.removeItem(MERGE_STORAGE_KEY);
+        }
+      } catch {
+        localStorage.removeItem(MERGE_STORAGE_KEY);
+      }
+    }
     hydrated = true;
     const updateNetwork = () => {
+      const wasOffline = !online;
       online = navigator.onLine;
       showOfflineNotice = !online;
+      if (wasOffline && online) {
+        onlineNotice = true;
+        savedLabel = '已重新联网，检查结果已按最新依赖重算';
+        window.setTimeout(() => { onlineNotice = false; }, 6000);
+      }
     };
     updateNetwork();
     window.addEventListener('online', updateNetwork);
@@ -210,6 +268,8 @@
   function migrateCourse(value: Course): Course {
     if (!value.id || !Array.isArray(value.activities)) return initialCourse();
     value.versions ??= [];
+    // 旧课程包没有修订号时直接升级为 R1，随后照常参与合并
+    if (typeof value.revision !== 'number' || !Number.isFinite(value.revision)) value.revision = 1;
     return value;
   }
 
@@ -220,6 +280,7 @@
     next.updatedAt = new Date().toISOString();
     course = next;
     future = [];
+    if (pendingMerge) syncPendingConflicts(next);
     persist();
   }
 
@@ -236,6 +297,7 @@
     history = history.slice(0, -1);
     course = previous;
     selectedActivityId = course.activities[0]?.id ?? '';
+    if (pendingMerge) syncPendingConflicts(previous);
     persist();
   }
 
@@ -246,6 +308,7 @@
     future = future.slice(1);
     course = next;
     selectedActivityId = course.activities[0]?.id ?? '';
+    if (pendingMerge) syncPendingConflicts(next);
     persist();
   }
 
@@ -380,6 +443,249 @@
       draft.activities = copy.activities;
     });
     savedLabel = '课程已复制为新草稿';
+  }
+
+  function persistPendingMerge(): void {
+    if (!pendingMerge) return;
+    localStorage.setItem(MERGE_STORAGE_KEY, JSON.stringify(pendingMerge));
+  }
+
+  // 外来课程包解析与升级：缺修订号的旧包升级为 R1，结构损坏直接抛错，本地草稿不受影响
+  function migrateCoursePackage(value: unknown): Course {
+    if (typeof value !== 'object' || value === null) throw new Error('文件不是有效的课程包');
+    const v = value as Record<string, unknown>;
+    if (!Array.isArray(v.activities)) throw new Error('课程包缺少活动清单');
+    if (typeof v.revision !== 'number' || !Number.isFinite(v.revision)) v.revision = 1;
+    if (!Array.isArray(v.versions)) v.versions = [];
+    for (const raw of v.activities as unknown[]) {
+      if (typeof raw !== 'object' || raw === null) throw new Error('活动数据格式不正确');
+      const a = raw as Record<string, unknown>;
+      if (typeof a.id !== 'string' || !a.id) throw new Error('活动缺少稳定编号');
+      if (typeof a.title !== 'string' || !a.title) a.title = '未命名活动';
+      if (typeof a.content !== 'string') a.content = '';
+      if (!Array.isArray(a.phonemes)) a.phonemes = [];
+      if (!Array.isArray(a.dependencies)) a.dependencies = [];
+      if (typeof a.type !== 'string') a.type = '练习';
+      if (typeof a.difficulty !== 'number' || !Number.isFinite(a.difficulty)) a.difficulty = 2;
+      if (typeof a.duration !== 'number' || !Number.isFinite(a.duration)) a.duration = 8;
+      if (typeof a.prompt !== 'string') a.prompt = '';
+      if (typeof a.accessibility !== 'string') a.accessibility = '';
+      if (typeof a.feedback !== 'string') a.feedback = '';
+    }
+    return v as unknown as Course;
+  }
+
+  // 合并结构冲突：依赖指向缺失活动，或依赖形成循环
+  function appendStructuralConflicts(merged: Course, conflicts: MergeConflict[]): void {
+    const ids = new Set(merged.activities.map((activity) => activity.id));
+    for (const activity of merged.activities) {
+      for (const dependency of activity.dependencies) {
+        if (!ids.has(dependency)) {
+          conflicts.push({
+            id: `missing-${activity.id}-${dependency}`,
+            kind: 'missing-dep',
+            activityId: activity.id,
+            dependencyId: dependency,
+            title: activity.title,
+            detail: `依赖「${dependency}」在合并后的活动清单中不存在。`,
+            resolution: 'pending'
+          });
+        }
+      }
+    }
+    const cycle = findDependencyCycle(merged.activities);
+    if (cycle) {
+      conflicts.push({
+        id: 'cycle',
+        kind: 'cycle',
+        activityId: cycle[0],
+        title: '依赖循环',
+        detail: `检测到循环依赖：${cycle.join(' → ')}`,
+        resolution: 'pending'
+      });
+    }
+  }
+
+  // 按稳定编号对齐活动：新活动直接接上；同编号活动标题/音素/依赖不同则两版都留下
+  function mergeCourses(local: Course, foreign: Course): { course: Course; conflicts: MergeConflict[]; addedCount: number } {
+    const draft = structuredClone(local);
+    const conflicts: MergeConflict[] = [];
+    const localMap = new Map(local.activities.map((activity) => [activity.id, activity]));
+    let addedCount = 0;
+
+    for (const foreignActivity of foreign.activities) {
+      if (!localMap.has(foreignActivity.id)) {
+        draft.activities.push(structuredClone(foreignActivity));
+        addedCount += 1;
+      }
+    }
+
+    for (const foreignActivity of foreign.activities) {
+      const localActivity = localMap.get(foreignActivity.id);
+      if (!localActivity) continue;
+      const diverged = localActivity.title !== foreignActivity.title
+        || JSON.stringify(localActivity.phonemes) !== JSON.stringify(foreignActivity.phonemes)
+        || JSON.stringify(localActivity.dependencies) !== JSON.stringify(foreignActivity.dependencies);
+      if (!diverged) continue;
+      const copy = structuredClone(foreignActivity);
+      const impId = `${foreignActivity.id}__imp`;
+      copy.id = impId;
+      draft.activities.push(copy);
+      conflicts.push({
+        id: `content-${foreignActivity.id}`,
+        kind: 'content',
+        activityId: foreignActivity.id,
+        foreignActivityId: impId,
+        title: localActivity.title,
+        detail: '标题、音素或依赖与本地版本不同，已先同时保留两版。',
+        resolution: 'pending'
+      });
+    }
+
+    // 版本快照随活动清单一起并入；外来快照使用新编号，避免覆盖本地快照
+    const versionIds = new Set(draft.versions.map((version) => version.id));
+    foreign.versions.forEach((version, index) => {
+      let id = version.id;
+      if (versionIds.has(id)) id = `v-imp-${index}-${Date.now()}`;
+      versionIds.add(id);
+      draft.versions.push({
+        ...structuredClone(version),
+        id,
+        label: `${version.label || '快照'}（外来）`
+      });
+    });
+
+    appendStructuralConflicts(draft, conflicts);
+    return { course: draft, conflicts, addedCount };
+  }
+
+  // 课程在待确认状态下被编辑后，按最新依赖重算结构冲突；内容差异冲突保留教师选择
+  function syncPendingConflicts(merged: Course): void {
+    const pm = pendingMerge;
+    if (!pm) return;
+    const kept = pm.conflicts.filter((conflict) => conflict.kind === 'content');
+    const fresh: MergeConflict[] = [...kept];
+    appendStructuralConflicts(merged, fresh);
+    pm.conflicts = fresh;
+    persistPendingMerge();
+  }
+
+  async function importCoursePackage(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    importError = '';
+    try {
+      const text = await file.text();
+      const foreign = migrateCoursePackage(JSON.parse(text) as unknown);
+      const { course: merged, conflicts, addedCount } = mergeCourses(course, foreign);
+      pendingMerge = {
+        id: `merge-${Date.now()}`,
+        sourceName: file.name,
+        importedAt: new Date().toISOString(),
+        addedCount,
+        baseCourse: structuredClone(course),
+        foreign,
+        conflicts
+      };
+      course = merged;
+      selectedActivityId = merged.activities[0]?.id ?? '';
+      persist();
+      persistPendingMerge();
+      activeView = 'versions';
+      savedLabel = '课程包已导入，等待确认合并';
+    } catch (err) {
+      // 导入中断或解析失败时本地草稿从未被改动，可直接重试
+      importError = `导入失败：${err instanceof Error ? err.message : '课程包无法解析'}。本地草稿未受影响，可重新选择文件重试。`;
+    }
+  }
+
+  function exportCoursePackage(): void {
+    const blob = new Blob([JSON.stringify(course, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${course.title || '课程包'}-R${course.revision}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function resolveContent(conflictId: string, choice: ConflictResolution): void {
+    const pm = pendingMerge;
+    if (!pm) return;
+    const conflict = pm.conflicts.find((item) => item.id === conflictId);
+    if (!conflict || conflict.kind !== 'content' || !conflict.foreignActivityId) return;
+    const foreignId = conflict.foreignActivityId;
+    commit((draft) => {
+      if (choice === 'keep-local') {
+        draft.activities = draft.activities.filter((activity) => activity.id !== foreignId);
+      } else if (choice === 'keep-foreign') {
+        draft.activities = draft.activities.filter((activity) => activity.id !== conflict.activityId);
+        const copy = draft.activities.find((activity) => activity.id === foreignId);
+        if (copy) {
+          copy.id = conflict.activityId;
+          draft.activities.forEach((activity) => {
+            activity.dependencies = activity.dependencies.map((dependency) => dependency === foreignId ? conflict.activityId : dependency);
+          });
+        }
+      }
+    });
+    conflict.resolution = choice;
+    if (choice === 'keep-foreign') conflict.foreignActivityId = conflict.activityId;
+    syncPendingConflicts(course);
+  }
+
+  function removeDependency(conflictId: string): void {
+    const pm = pendingMerge;
+    if (!pm) return;
+    const conflict = pm.conflicts.find((item) => item.id === conflictId);
+    if (!conflict || conflict.kind !== 'missing-dep' || !conflict.dependencyId) return;
+    commit((draft) => {
+      const target = draft.activities.find((activity) => activity.id === conflict.activityId);
+      if (target) target.dependencies = target.dependencies.filter((dependency) => dependency !== conflict.dependencyId);
+    });
+    syncPendingConflicts(course);
+  }
+
+  function locateActivity(activityId: string): void {
+    selectedActivityId = activityId;
+    activeView = 'compose';
+  }
+
+  function getActivity(activityId: string): Activity | undefined {
+    return course.activities.find((item) => item.id === activityId);
+  }
+
+  function confirmMerge(): void {
+    const pm = pendingMerge;
+    if (!pm || blockingConflicts.length) return;
+    const nextRevision = Math.max(course.revision ?? 1, pm.foreign.revision ?? 1) + 1;
+    const contentCount = pm.conflicts.filter((conflict) => conflict.kind === 'content').length;
+    commit((draft) => {
+      draft.revision = nextRevision;
+      draft.versions.push({
+        id: `v-${Date.now()}`,
+        label: `合并版本 R${nextRevision}`,
+        savedAt: new Date().toISOString(),
+        note: `合并 ${pm.sourceName}：新增 ${pm.addedCount} 个活动，${contentCount} 处差异两版并留，共 ${draft.activities.length} 个活动。`,
+        activities: structuredClone(draft.activities)
+      });
+    });
+    pendingMerge = null;
+    localStorage.removeItem(MERGE_STORAGE_KEY);
+    savedLabel = '合并完成，已生成新版本';
+  }
+
+  function discardMerge(): void {
+    const pm = pendingMerge;
+    if (!pm) return;
+    course = structuredClone(pm.baseCourse);
+    pendingMerge = null;
+    localStorage.removeItem(MERGE_STORAGE_KEY);
+    selectedActivityId = course.activities[0]?.id ?? '';
+    persist();
+    savedLabel = '已放弃合并，恢复本地草稿';
   }
 
   function focusIssue(issue: Diagnostic): void {
@@ -565,16 +871,51 @@
       <strong>{savedLabel}</strong>
     </div>
     <div class="header-actions">
+      {#if pendingCount > 0}
+        <button class="pending-badge" on:click={() => (activeView = 'versions')}>
+          待确认 <strong>{pendingCount}</strong>
+        </button>
+      {/if}
       <Button size="small" kind="ghost" disabled={history.length === 0} on:click={undo}>撤销</Button>
       <Button size="small" kind="ghost" disabled={future.length === 0} on:click={redo}>重做</Button>
       <Button size="small" kind="tertiary" on:click={saveNow}>保存</Button>
-      <Button size="small" kind="primary" on:click={saveVersion}>存档版本</Button>
+      <Button size="small" kind="primary" disabled={!!pendingMerge} on:click={saveVersion}>存档版本</Button>
     </div>
   </header>
 
   {#if showOfflineNotice}
     <div class="offline-notice">
       <InlineNotification lowContrast kind="info" title="已切换到离线模式" subtitle="所有修改会先保存在本机浏览器，恢复网络后仍可继续编辑。" />
+    </div>
+  {/if}
+
+  {#if onlineNotice}
+    <div class="offline-notice">
+      <InlineNotification lowContrast kind="success" title="已恢复联网" subtitle="课程检查结果已按最新依赖重新计算；如有合并冲突，请在版本页确认。" />
+    </div>
+  {/if}
+
+  {#if pendingMerge}
+    <div class="merge-banner">
+      <InlineNotification
+        lowContrast
+        kind="warning"
+        title="课程包合并待确认"
+        subtitle={`已导入 ${pendingMerge.sourceName}，合并草稿已保留在本机。还有 ${pendingCount} 项冲突待处理，教师确认前不会写入新版本。`}
+      />
+      <div class="merge-banner-actions">
+        <Button size="small" kind="primary" on:click={() => (activeView = 'versions')}>去处理冲突</Button>
+        <Button size="small" kind="ghost" on:click={discardMerge}>放弃合并</Button>
+      </div>
+    </div>
+  {/if}
+
+  {#if importError}
+    <div class="merge-banner">
+      <InlineNotification lowContrast kind="error" title="导入中断" subtitle={importError} />
+      <div class="merge-banner-actions">
+        <Button size="small" kind="primary" on:click={() => (activeView = 'versions')}>重新选择文件</Button>
+      </div>
     </div>
   {/if}
 
@@ -596,7 +937,7 @@
     <button class:active={activeView === 'compose'} on:click={() => activeView = 'compose'}><span>01</span><b>课程编排</b><small>活动、依赖与教学说明</small></button>
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
-    <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small>{#if pendingCount > 0}<em class="tab-badge">{pendingCount}</em>{/if}</button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -771,12 +1112,101 @@
   {#if activeView === 'versions'}
     <main class="versions-view">
       <div class="view-heading">
-        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。</p></div>
-        <div class="version-actions"><Button kind="tertiary" on:click={copyCourse}>复制课程</Button><Button kind="primary" on:click={saveVersion}>保存新版本</Button></div>
+        <div><span class="kicker">REUSE & HISTORY</span><h2>版本与课程复用</h2><p>复制课程不会覆盖原课程；存档版本包含完整活动、依赖和教学说明。断网编辑后可导入其他老师的课程包合并。</p></div>
+        <div class="version-actions">
+          <Button kind="ghost" on:click={exportCoursePackage}>导出课程包</Button>
+          <Button kind="tertiary" on:click={() => importInput?.click()}>导入课程包合并</Button>
+          <input bind:this={importInput} type="file" accept="application/json,.json" style="display:none" on:change={importCoursePackage} />
+          <Button kind="tertiary" on:click={copyCourse} disabled={!!pendingMerge}>复制课程</Button>
+          <Button kind="primary" on:click={saveVersion} disabled={!!pendingMerge}>保存新版本</Button>
+        </div>
       </div>
+
+      {#if pendingMerge}
+        <Tile class="merge-panel">
+          <div class="section-title">
+            <div>
+              <span class="kicker">MERGE REVIEW</span>
+              <h3>合并待确认</h3>
+              <p>来源：{pendingMerge.sourceName} · {formatTime(pendingMerge.importedAt)} · 确认前不会写入新版本</p>
+            </div>
+            <Tag type={pendingCount ? 'red' : 'green'}>{pendingCount} 项待确认</Tag>
+          </div>
+
+          <div class="merge-summary">
+            <span>新增活动<b>{pendingMerge.addedCount}</b></span>
+            <span>内容差异<b>{contentConflictCount}</b></span>
+            <span>依赖缺失<b>{missingDepCount}</b></span>
+            <span>循环依赖<b>{cycleConflictCount}</b></span>
+          </div>
+
+          <div class="conflict-list">
+            {#each pendingMerge.conflicts as conflict (conflict.id)}
+              {#if conflict.kind === 'content'}
+                <article class="conflict-card content" class:resolved={conflict.resolution !== 'pending'}>
+                  <header><Tag type="blue">内容差异</Tag><b>{conflict.title}</b>{#if conflict.resolution !== 'pending'}<span class="resolution-tag">{conflict.resolution === 'keep-local' ? '已保留本地' : conflict.resolution === 'keep-foreign' ? '已保留外来' : '已保留两版'}</span>{/if}</header>
+                  <p>{conflict.detail}</p>
+                  <div class="content-versions">
+                    <div class="version-col">
+                      <h5>本地版</h5>
+                      {#if getActivity(conflict.activityId)}
+                        <b>{getActivity(conflict.activityId)?.title}</b>
+                        <small>音素：{getActivity(conflict.activityId)?.phonemes.join('、') || '—'}</small>
+                        <small>依赖：{getActivity(conflict.activityId)?.dependencies.length ? getActivity(conflict.activityId)?.dependencies.join('、') : '无'}</small>
+                      {/if}
+                    </div>
+                    <div class="version-col">
+                      <h5>外来版</h5>
+                      {#if getActivity(conflict.foreignActivityId ?? '')}
+                        <b>{getActivity(conflict.foreignActivityId ?? '')?.title}</b>
+                        <small>音素：{getActivity(conflict.foreignActivityId ?? '')?.phonemes.join('、') || '—'}</small>
+                        <small>依赖：{getActivity(conflict.foreignActivityId ?? '')?.dependencies.length ? getActivity(conflict.foreignActivityId ?? '')?.dependencies.join('、') : '无'}</small>
+                      {:else}
+                        <small>已选择保留本地，外来版已移除。</small>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="conflict-actions">
+                    <Button size="small" kind={conflict.resolution === 'keep-local' ? 'primary' : 'ghost'} on:click={() => resolveContent(conflict.id, 'keep-local')}>保留本地</Button>
+                    <Button size="small" kind={conflict.resolution === 'keep-foreign' ? 'primary' : 'ghost'} on:click={() => resolveContent(conflict.id, 'keep-foreign')}>保留外来</Button>
+                    <Button size="small" kind={conflict.resolution === 'keep-both' ? 'tertiary' : 'ghost'} on:click={() => resolveContent(conflict.id, 'keep-both')}>保留两版</Button>
+                  </div>
+                </article>
+              {:else if conflict.kind === 'missing-dep'}
+                <article class="conflict-card missing" class:resolved={conflict.resolution !== 'pending'}>
+                  <header><Tag type="red">依赖缺失</Tag><b>{conflict.title}</b></header>
+                  <p>{conflict.detail}</p>
+                  <div class="conflict-actions">
+                    <Button size="small" kind="ghost" on:click={() => locateActivity(conflict.activityId)}>定位活动</Button>
+                    <Button size="small" kind="danger-ghost" on:click={() => removeDependency(conflict.id)}>移除失效依赖</Button>
+                  </div>
+                </article>
+              {:else}
+                <article class="conflict-card cycle">
+                  <header><Tag type="red">循环依赖</Tag><b>依赖循环</b></header>
+                  <p>{conflict.detail}</p>
+                  <div class="conflict-actions">
+                    <Button size="small" kind="ghost" on:click={() => locateActivity(conflict.activityId)}>定位活动并调整依赖</Button>
+                  </div>
+                </article>
+              {/if}
+            {:else}
+              <p class="empty-state">没有冲突，合并内容可以确认。</p>
+            {/each}
+          </div>
+
+          <div class="merge-footer">
+            <Button kind="danger-ghost" on:click={discardMerge}>放弃合并并恢复本地草稿</Button>
+            <Button kind="primary" disabled={blockingConflicts.length > 0} on:click={confirmMerge}>
+              {blockingConflicts.length ? `仍有 ${blockingConflicts.length} 项依赖问题未解决` : '确认合并并生成新版本'}
+            </Button>
+          </div>
+        </Tile>
+      {/if}
+
       <div class="version-layout-svelte">
         <Tile class="version-timeline">
-          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">{course.versions.length} 个快照</Tag></div>
+          <div class="section-title"><div><span class="kicker">TIMELINE</span><h3>课程版本</h3></div><Tag type="cool-gray">R{course.revision} · {course.versions.length} 个快照</Tag></div>
           {#each course.versions as version, index (version.id)}
             <article class:latest={index === course.versions.length - 1}>
               <span class="timeline-dot"></span>
